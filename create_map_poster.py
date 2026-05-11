@@ -18,6 +18,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import cast
 
+import io
+import math
+
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
@@ -211,6 +214,260 @@ def load_theme(theme_name="terracotta"):
 THEME = dict[str, str]()  # Will be loaded later
 
 
+def fetch_park_boundary(park_name):
+    """
+    Fetch the park boundary polygon directly from OSM by name using
+    ox.geocode_to_gdf, which returns the actual admin/boundary relation
+    as a proper polygon — not the piecemeal ways that features_from_point returns.
+    Returns a GeoDataFrame in WGS84, or None on failure.
+    """
+    cache_key = f"boundary_{park_name.lower().replace(' ', '_')}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        print("✓ Using cached park boundary")
+        return cached
+
+    queries = [
+        park_name,
+        f"{park_name} National Park",
+        f"{park_name} State Park",
+    ]
+    for query in queries:
+        try:
+            gdf = ox.geocode_to_gdf(query)
+            if gdf is not None and not gdf.empty:
+                print(f"✓ Park boundary fetched for: {query}")
+                try:
+                    cache_set(cache_key, gdf)
+                except CacheError:
+                    pass
+                return gdf
+        except Exception:
+            continue
+
+    print("⚠ No park boundary found in OSM for this location")
+    return None
+
+
+def render_park_boundary(ax, boundary_gdf, graph_crs, outline_color, exterior_color):
+    """
+    Render the park boundary:
+      - A semi-transparent dark overlay outside the park boundary
+      - A dashed outline on the boundary edge
+    """
+    from shapely.geometry import box
+    from shapely.ops import unary_union
+    import geopandas as gpd
+
+    # Always reproject to the same CRS as the graph — never re-derive a new UTM zone
+    try:
+        boundary_proj = boundary_gdf.to_crs(graph_crs)
+    except Exception:
+        boundary_proj = ox.projection.project_gdf(boundary_gdf)
+
+    park_shape = unary_union(boundary_proj.geometry)
+
+    # Snapshot limits before plotting — gdf.plot() auto-expands them
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+
+    padding = max(xlim[1] - xlim[0], ylim[1] - ylim[0]) * 0.5
+    big_box = box(
+        xlim[0] - padding, ylim[0] - padding,
+        xlim[1] + padding, ylim[1] + padding,
+    )
+
+    # Exterior = big box minus the park shape
+    exterior = big_box.difference(park_shape)
+    exterior_gdf = gpd.GeoDataFrame(geometry=[exterior], crs=boundary_proj.crs)
+    exterior_gdf.plot(
+        ax=ax,
+        facecolor=exterior_color,
+        edgecolor='none',
+        alpha=0.35,
+        zorder=2.0,
+    )
+
+    # Boundary outline
+    boundary_proj.plot(
+        ax=ax,
+        facecolor='none',
+        edgecolor=outline_color,
+        linewidth=1.5,
+        linestyle='--',
+        zorder=2.1,
+    )
+
+    # Restore limits — prevent the large exterior polygon from zooming out
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+
+
+def fetch_dem(point, dist):
+    """
+    Fetch a Digital Elevation Model from the USGS 3DEP service (US only).
+    Returns (dem_array, transform, crs) or (None, None, None) on failure.
+    Uses the same cache system as other features.
+    """
+    try:
+        import rasterio
+        import rasterio.transform
+    except ImportError:
+        print("⚠ rasterio not installed — skipping topography. Run: pip install rasterio")
+        return None, None, None
+
+    lat, lon = point
+    cache_key = f"dem_{lat:.4f}_{lon:.4f}_{dist}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        print("✓ Using cached elevation data")
+        return cached
+
+    # Build WGS84 bounding box from center + distance (in meters)
+    lat_delta = dist / 111000
+    lon_delta = dist / (111000 * math.cos(math.radians(lat)))
+    west, east = lon - lon_delta, lon + lon_delta
+    south, north = lat - lat_delta, lat + lat_delta
+
+    url = (
+        "https://elevation.nationalmap.gov/arcgis/rest/services/"
+        "3DEPElevation/ImageServer/exportImage"
+    )
+    params = {
+        "bbox": f"{west},{south},{east},{north}",
+        "bboxSR": "4326",
+        "size": "512,512",
+        "imageSR": "4326",
+        "format": "tiff",
+        "pixelType": "F32",
+        "noDataInterpretation": "esriNoDataMatchAny",
+        "f": "image",
+    }
+
+    try:
+        import requests as _requests
+        print("Downloading elevation data from USGS 3DEP...")
+        resp = _requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        with rasterio.open(io.BytesIO(resp.content)) as src:
+            dem = src.read(1).astype(np.float32)
+            transform = src.transform
+            crs = src.crs
+        result = (dem, transform, crs)
+        try:
+            cache_set(cache_key, result)
+        except CacheError:
+            pass
+        print("✓ Elevation data downloaded")
+        return result
+    except Exception as e:
+        print(f"⚠ Elevation fetch failed: {e}")
+        return None, None, None
+
+
+def compute_hillshade(dem, azimuth=315, altitude=45):
+    """
+    Compute a hillshade array from a DEM using numpy.
+    azimuth: sun direction in degrees (315 = NW, classic cartographic default)
+    altitude: sun angle above horizon in degrees
+    """
+    dem = np.where(dem < -1000, np.nan, dem.astype(np.float64))
+    dem_filled = np.where(np.isnan(dem), 0.0, dem)
+    dy, dx = np.gradient(dem_filled)
+    azimuth_rad = np.radians(360.0 - azimuth)
+    altitude_rad = np.radians(altitude)
+    slope = np.arctan(np.sqrt(dx ** 2 + dy ** 2))
+    aspect = np.arctan2(-dy, dx)
+    hs = (
+        np.sin(altitude_rad) * np.cos(slope)
+        + np.cos(altitude_rad) * np.sin(slope) * np.cos(azimuth_rad - aspect)
+    )
+    return np.clip(hs, 0.0, 1.0)
+
+
+def render_topo(ax, dem, dem_transform, dem_crs, graph_crs, contour_interval=200, hillshade_alpha=0.55):
+    """
+    Reproject DEM to the graph's projected CRS, then render:
+      - hillshade as a semi-transparent grayscale layer (z=0.2)
+      - contour lines at the requested interval in meters (z=0.3)
+    """
+    try:
+        import rasterio.warp
+        from rasterio.crs import CRS as RasterioCRS
+    except ImportError:
+        return
+
+    h, w = dem.shape
+
+    # Build source bounds from affine transform
+    left = dem_transform.c
+    top = dem_transform.f
+    right = left + dem_transform.a * w
+    bottom = top + dem_transform.e * h  # e is negative for north-up rasters
+
+    target_crs = RasterioCRS.from_user_input(graph_crs)
+
+    dst_transform, dst_w, dst_h = rasterio.warp.calculate_default_transform(
+        dem_crs, target_crs, w, h,
+        left=left, bottom=bottom, right=right, top=top,
+    )
+
+    dem_proj = np.zeros((dst_h, dst_w), dtype=np.float32)
+    rasterio.warp.reproject(
+        source=dem,
+        destination=dem_proj,
+        src_transform=dem_transform,
+        src_crs=dem_crs,
+        dst_transform=dst_transform,
+        dst_crs=target_crs,
+        resampling=rasterio.warp.Resampling.bilinear,
+    )
+
+    # Projected extent (x_left, x_right, y_bottom, y_top)
+    proj_left = dst_transform.c
+    proj_top = dst_transform.f
+    proj_right = proj_left + dst_transform.a * dst_w
+    proj_bottom = proj_top + dst_transform.e * dst_h
+    extent = [proj_left, proj_right, proj_bottom, proj_top]
+
+    # --- Hillshade ---
+    hs = compute_hillshade(dem_proj)
+    ax.imshow(
+        hs,
+        extent=extent,
+        cmap="gray",
+        alpha=hillshade_alpha,
+        zorder=0.2,
+        origin="upper",
+        aspect="auto",
+        interpolation="bilinear",
+    )
+
+    # --- Contour lines ---
+    valid = dem_proj[dem_proj > -1000]
+    if valid.size == 0:
+        return
+    min_ele = np.floor(valid.min() / contour_interval) * contour_interval
+    max_ele = np.ceil(valid.max() / contour_interval) * contour_interval
+    levels = np.arange(min_ele, max_ele + contour_interval, contour_interval)
+    if len(levels) < 2:
+        return
+
+    xs = np.linspace(proj_left, proj_right, dst_w)
+    ys = np.linspace(proj_top, proj_bottom, dst_h)
+    X, Y = np.meshgrid(xs, ys)
+    dem_masked = np.where(dem_proj < -1000, np.nan, dem_proj)
+
+    ax.contour(
+        X, Y, dem_masked,
+        levels=levels,
+        colors=THEME.get("contours", "#8B7355"),
+        linewidths=0.5,
+        zorder=0.9,
+        alpha=0.7,
+    )
+
+
 def create_gradient_fade(ax, color, location="bottom", zorder=10):
     """
     Creates a fade effect at the top or bottom of the map.
@@ -250,6 +507,78 @@ def create_gradient_fade(ax, color, location="bottom", zorder=10):
         zorder=zorder,
         origin="lower",
     )
+
+
+def filter_major_pois(gdf, poi_type, max_peaks=15):
+    """
+    Filter a POI GeoDataFrame to only 'major' features to reduce clutter.
+
+    - peaks: requires a name, sorts by elevation (ele tag), keeps top max_peaks
+    - all others: requires a name
+    """
+    if gdf is None or gdf.empty:
+        return gdf
+
+    points = gdf[gdf.geometry.type == "Point"].copy()
+    if points.empty:
+        return points
+
+    # All types: require a name
+    if 'name' in points.columns:
+        points = points[points['name'].apply(lambda n: isinstance(n, str) and bool(n.strip()))]
+
+    if poi_type == 'peaks' and not points.empty:
+        if 'ele' in points.columns:
+            def _to_float(v):
+                try:
+                    return float(str(v).split(';')[0].strip())
+                except (ValueError, TypeError):
+                    return None
+            points = points.copy()
+            points['_ele_num'] = points['ele'].apply(_to_float)
+            # Prefer peaks with elevation data; fall back to any named peak
+            with_ele = points[points['_ele_num'].notna()].nlargest(max_peaks, '_ele_num')
+            without_ele = points[points['_ele_num'].isna()].head(max(0, max_peaks - len(with_ele)))
+            import pandas as pd
+            points = pd.concat([with_ele, without_ele]).drop(columns=['_ele_num'])
+        else:
+            points = points.head(max_peaks)
+
+    return points
+
+
+def render_poi_markers(ax, gdf, graph_crs, color, marker, size, zorder, label=False, font_size=5):
+    """
+    Render point-of-interest markers on the projected map axes.
+    Projects the GDF to the graph CRS before extracting coordinates.
+    If label=True, annotates each point with its OSM name where available.
+    """
+    if gdf is None or gdf.empty:
+        return
+    points = gdf[gdf.geometry.type == "Point"].copy()
+    if points.empty:
+        return
+    try:
+        points = ox.projection.project_gdf(points)
+    except Exception:
+        points = points.to_crs(graph_crs)
+    xs = [geom.x for geom in points.geometry]
+    ys = [geom.y for geom in points.geometry]
+    ax.scatter(xs, ys, c=color, marker=marker, s=size, zorder=zorder, linewidths=0)
+    if label and 'name' in points.columns:
+        for x, y, name in zip(xs, ys, points['name']):
+            if isinstance(name, str) and name.strip():
+                ax.annotate(
+                    name,
+                    xy=(x, y),
+                    xytext=(4, 4),
+                    textcoords='offset points',
+                    color=THEME.get('text', '#2D3B2E'),
+                    fontsize=font_size,
+                    zorder=zorder + 0.1,
+                    ha='left',
+                    va='bottom',
+                )
 
 
 def get_edge_colors_by_type(g):
@@ -368,6 +697,76 @@ def get_coordinates(city, country):
         return (location.latitude, location.longitude)
 
     raise ValueError(f"Could not find coordinates for {city}, {country}")
+
+
+def get_park_info(park_name):
+    """
+    Geocode a national or state park by name using Nominatim.
+    Returns (lat, lon, distance_meters, display_name) where distance is
+    derived from the OSM bounding box so the whole park fits in the frame.
+    Caps at 60000m to keep data fetching manageable.
+    """
+    cache_key = f"park_{park_name.lower().replace(' ', '_')}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        print(f"✓ Using cached park info for {park_name}")
+        return cached
+
+    print(f"Looking up park: {park_name}...")
+    geolocator = Nominatim(user_agent="city_map_poster", timeout=10)
+    time.sleep(1)
+
+    # Try progressively broader queries until we get a boundary result
+    queries = [
+        park_name,
+        f"{park_name} National Park",
+        f"{park_name} State Park",
+    ]
+    location = None
+    for query in queries:
+        try:
+            location = geolocator.geocode(query, exactly_one=True)
+            if location:
+                break
+        except Exception as e:
+            raise ValueError(f"Geocoding failed for '{park_name}': {e}") from e
+
+    if location is None:
+        raise ValueError(
+            f"Could not find '{park_name}'. Try adding 'National Park' or 'State Park' to the name."
+        )
+
+    print(f"✓ Found: {location.address}")
+
+    # Derive distance and true center from the Nominatim bounding box.
+    # raw['boundingbox'] = [south, north, west, east] as strings.
+    # Nominatim's lat/lon is the OSM relation centroid, which is often off-center
+    # for irregular park shapes — use the bbox midpoint instead.
+    bbox = location.raw.get("boundingbox")
+    if bbox:
+        south, north, west, east = [float(v) for v in bbox]
+        lat = (south + north) / 2
+        lon = (west + east) / 2
+        lat_span_m = (north - south) * 111000
+        lon_span_m = (east - west) * 111000 * math.cos(math.radians(lat))
+        # Use the larger dimension as the radius, add 15% padding, cap at 60km
+        dist = int(min(max(lat_span_m, lon_span_m) / 2 * 1.15, 60000))
+    else:
+        lat, lon = location.latitude, location.longitude
+        dist = 20000  # fallback
+
+    print(f"✓ Center: {lat:.4f}, {lon:.4f}")
+    print(f"✓ Auto-distance: {dist}m")
+
+    # Clean up display name: strip country/state suffix, keep the park name
+    display_name = location.address.split(",")[0].strip()
+
+    result = (lat, lon, dist, display_name)
+    try:
+        cache_set(cache_key, result)
+    except CacheError:
+        pass
+    return result
 
 
 def get_crop_limits(g_proj, center_lat_lon, fig, dist):
@@ -493,6 +892,13 @@ def create_poster(
     display_city=None,
     display_country=None,
     fonts=None,
+    park_mode=False,
+    park_labels=False,
+    max_peaks=15,
+    topo_mode=False,
+    contour_interval=200,
+    show_boundary=False,
+    park_name=None,
 ):
     """
     Generate a complete map poster with roads, water, parks, and typography.
@@ -523,16 +929,23 @@ def create_poster(
     print(f"\nGenerating map for {city}, {country}...")
 
     # Progress bar for data fetching
+    trails = peaks = viewpoints = campgrounds = trailheads = None
+    dem = dem_transform = dem_crs = None
+    park_boundary = None
+    total_steps = (8 if park_mode else 3) + (1 if topo_mode else 0) + (1 if show_boundary else 0)
     with tqdm(
-        total=3,
+        total=total_steps,
         desc="Fetching map data",
         unit="step",
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}",
     ) as pbar:
         # 1. Fetch Street Network
         pbar.set_description("Downloading street network")
-        compensated_dist = dist * (max(height, width) / min(height, width)) / 4  # To compensate for viewport crop
-        g = fetch_graph(point, compensated_dist)
+        # fetch_dist: square bbox radius used for all data downloads.
+        # Must cover the full visible crop area (half_y = dist for portrait,
+        # half_x = dist for landscape) plus 15% buffer for edge roads.
+        fetch_dist = int(dist * 1.15)
+        g = fetch_graph(point, fetch_dist)
         if g is None:
             raise RuntimeError("Failed to retrieve street network data.")
         pbar.update(1)
@@ -541,21 +954,87 @@ def create_poster(
         pbar.set_description("Downloading water features")
         water = fetch_features(
             point,
-            compensated_dist,
+            fetch_dist,
             tags={"natural": ["water", "bay", "strait"], "waterway": "riverbank"},
             name="water",
         )
         pbar.update(1)
 
-        # 3. Fetch Parks
+        # 3. Fetch Green Spaces (expanded tags in park mode)
         pbar.set_description("Downloading parks/green spaces")
-        parks = fetch_features(
-            point,
-            compensated_dist,
-            tags={"leisure": "park", "landuse": "grass"},
-            name="parks",
-        )
+        if park_mode:
+            # Exclude leisure=nature_reserve and boundary=national_park — these
+            # return a single polygon covering the entire park including lakes,
+            # which buries water features. Stick to landuse/natural sub-polygons only.
+            green_tags = {
+                "landuse": ["forest", "meadow", "grass", "recreation_ground"],
+                "natural": ["wood", "scrub", "heath", "grassland"],
+            }
+        else:
+            green_tags = {"leisure": "park", "landuse": "grass"}
+        parks = fetch_features(point, fetch_dist, tags=green_tags, name="parks")
         pbar.update(1)
+
+        if park_mode:
+            # 4. Fetch Trails
+            pbar.set_description("Downloading trails")
+            trails = fetch_features(
+                point,
+                fetch_dist,
+                tags={"highway": ["path", "track", "bridleway"]},
+                name="trails",
+            )
+            pbar.update(1)
+
+            # 5. Fetch Peaks / Summits
+            pbar.set_description("Downloading peaks")
+            peaks = fetch_features(
+                point,
+                fetch_dist,
+                tags={"natural": ["peak", "saddle"]},
+                name="peaks",
+            )
+            pbar.update(1)
+
+            # 6. Fetch Viewpoints
+            pbar.set_description("Downloading viewpoints")
+            viewpoints = fetch_features(
+                point,
+                fetch_dist,
+                tags={"tourism": "viewpoint"},
+                name="viewpoints",
+            )
+            pbar.update(1)
+
+            # 7. Fetch Campgrounds
+            pbar.set_description("Downloading campgrounds")
+            campgrounds = fetch_features(
+                point,
+                fetch_dist,
+                tags={"tourism": "camp_site"},
+                name="campgrounds",
+            )
+            pbar.update(1)
+
+            # 8. Fetch Trailheads
+            pbar.set_description("Downloading trailheads")
+            trailheads = fetch_features(
+                point,
+                fetch_dist,
+                tags={"highway": "trailhead"},
+                name="trailheads",
+            )
+            pbar.update(1)
+
+        if topo_mode:
+            pbar.set_description("Downloading elevation data")
+            dem, dem_transform, dem_crs = fetch_dem(point, fetch_dist)
+            pbar.update(1)
+
+        if show_boundary:
+            pbar.set_description("Downloading park boundary")
+            park_boundary = fetch_park_boundary(park_name or city)
+            pbar.update(1)
 
     print("✓ All data retrieved successfully!")
 
@@ -569,6 +1048,13 @@ def create_poster(
     g_proj = ox.project_graph(g)
 
     # 3. Plot Layers
+    # Layer: Hillshade + Contours (topo mode only, rendered first so everything sits on top)
+    if topo_mode and dem is not None:
+        render_topo(
+            ax, dem, dem_transform, dem_crs,
+            g_proj.graph['crs'],
+            contour_interval=contour_interval,
+        )
     # Layer 1: Polygons (filter to only plot polygon/multipolygon geometries, not points)
     if water is not None and not water.empty:
         # Filter to only polygon/multipolygon geometries to avoid point features showing as dots
@@ -579,7 +1065,7 @@ def create_poster(
                 water_polys = ox.projection.project_gdf(water_polys)
             except Exception:
                 water_polys = water_polys.to_crs(g_proj.graph['crs'])
-            water_polys.plot(ax=ax, facecolor=THEME['water'], edgecolor='none', zorder=0.5)
+            water_polys.plot(ax=ax, facecolor=THEME['water'], edgecolor='none', zorder=1.2)
 
     if parks is not None and not parks.empty:
         # Filter to only polygon/multipolygon geometries to avoid point features showing as dots
@@ -590,14 +1076,31 @@ def create_poster(
                 parks_polys = ox.projection.project_gdf(parks_polys)
             except Exception:
                 parks_polys = parks_polys.to_crs(g_proj.graph['crs'])
-            parks_polys.plot(ax=ax, facecolor=THEME['parks'], edgecolor='none', zorder=0.8)
+            parks_alpha = 0.45 if topo_mode else 1.0
+            parks_polys.plot(ax=ax, facecolor=THEME['parks'], edgecolor='none', zorder=0.8, alpha=parks_alpha)
+
+    # Layer: Trails (park mode only)
+    if park_mode and trails is not None and not trails.empty:
+        trail_lines = trails[trails.geometry.type.isin(["LineString", "MultiLineString"])].copy()
+        if not trail_lines.empty:
+            try:
+                trail_lines = ox.projection.project_gdf(trail_lines)
+            except Exception:
+                trail_lines = trail_lines.to_crs(g_proj.graph['crs'])
+            trail_lines.plot(
+                ax=ax,
+                color=THEME.get('trails', '#8B5E3C'),
+                linewidth=0.35,
+                zorder=0.6,
+            )
+
     # Layer 2: Roads with hierarchy coloring
     print("Applying road hierarchy colors...")
     edge_colors = get_edge_colors_by_type(g_proj)
     edge_widths = get_edge_widths_by_type(g_proj)
 
     # Determine cropping limits to maintain the poster aspect ratio
-    crop_xlim, crop_ylim = get_crop_limits(g_proj, point, fig, compensated_dist)
+    crop_xlim, crop_ylim = get_crop_limits(g_proj, point, fig, dist)
     # Plot the projected graph and then apply the cropped limits
     ox.plot_graph(
         g_proj, ax=ax, bgcolor=THEME['bg'],
@@ -611,9 +1114,27 @@ def create_poster(
     ax.set_xlim(crop_xlim)
     ax.set_ylim(crop_ylim)
 
+    # Layer: Park boundary outline + exterior shading
+    if show_boundary and park_boundary is not None:
+        render_park_boundary(
+            ax, park_boundary, g_proj.graph['crs'],
+            outline_color=THEME.get('boundary', '#2D3B2E'),
+            exterior_color=THEME.get('bg', '#EDE8DC'),
+        )
+    elif show_boundary:
+        print("⚠ No park boundary found in OSM for this location")
+
     # Layer 3: Gradients (Top and Bottom)
     create_gradient_fade(ax, THEME['gradient_color'], location='bottom', zorder=10)
     create_gradient_fade(ax, THEME['gradient_color'], location='top', zorder=10)
+
+    # Layer: POI Markers (park mode only)
+    if park_mode:
+        graph_crs = g_proj.graph['crs']
+        render_poi_markers(ax, filter_major_pois(peaks, 'peaks', max_peaks), graph_crs, THEME.get('peaks', '#4A3728'), '^', 30, 1.5, label=park_labels, font_size=5)
+        render_poi_markers(ax, filter_major_pois(viewpoints, 'viewpoints'), graph_crs, THEME.get('viewpoints', '#B8860B'), 'o', 20, 1.5, label=park_labels, font_size=5)
+        render_poi_markers(ax, filter_major_pois(campgrounds, 'campgrounds'), graph_crs, THEME.get('campgrounds', '#8B2020'), 'v', 20, 1.5, label=park_labels, font_size=5)
+        render_poi_markers(ax, filter_major_pois(trailheads, 'trailheads'), graph_crs, THEME.get('trailheads', '#5C3D1E'), 'D', 18, 1.5, label=park_labels, font_size=5)
 
     # Calculate scale factor based on smaller dimension (reference 12 inches)
     # This ensures text scales properly for both portrait and landscape orientations
@@ -871,6 +1392,11 @@ Examples:
         """,
     )
 
+    parser.add_argument(
+        "--park", "-p", type=str,
+        help='National or state park name (e.g. "Yosemite", "Rocky Mountain"). '
+             'Auto-sets distance, park-mode, park-labels, topo-mode, and show-boundary.',
+    )
     parser.add_argument("--city", "-c", type=str, help="City name")
     parser.add_argument("--country", "-C", type=str, help="Country name")
     parser.add_argument(
@@ -911,8 +1437,8 @@ Examples:
         "--distance",
         "-d",
         type=int,
-        default=18000,
-        help="Map radius in meters (default: 18000)",
+        default=None,
+        help="Map radius in meters (default: 18000, or auto-calculated with --park)",
     )
     parser.add_argument(
         "--width",
@@ -955,6 +1481,44 @@ Examples:
         choices=["png", "svg", "pdf"],
         help="Output format for the poster (default: png)",
     )
+    parser.add_argument(
+        "--park-mode",
+        dest="park_mode",
+        action="store_true",
+        help="Enable national/state park mode: fetches trails, peaks, viewpoints, campgrounds, trailheads, and expanded green spaces",
+    )
+    parser.add_argument(
+        "--park-labels",
+        dest="park_labels",
+        action="store_true",
+        help="Label peaks, viewpoints, campgrounds, and trailheads with their names (requires --park-mode)",
+    )
+    parser.add_argument(
+        "--max-peaks",
+        dest="max_peaks",
+        type=int,
+        default=15,
+        help="Maximum number of peaks to show, ranked by elevation (default: 15, requires --park-mode)",
+    )
+    parser.add_argument(
+        "--topo-mode",
+        dest="topo_mode",
+        action="store_true",
+        help="Add hillshade and contour lines from USGS 3DEP elevation data (US parks only, requires rasterio)",
+    )
+    parser.add_argument(
+        "--contour-interval",
+        dest="contour_interval",
+        type=int,
+        default=200,
+        help="Contour line interval in meters (default: 200, requires --topo-mode)",
+    )
+    parser.add_argument(
+        "--show-boundary",
+        dest="show_boundary",
+        action="store_true",
+        help="Outline the park boundary and shade the surrounding area to make the park stand out",
+    )
 
     args = parser.parse_args()
 
@@ -969,8 +1533,8 @@ Examples:
         sys.exit(0)
 
     # Validate required arguments
-    if not args.city or not args.country:
-        print("Error: --city and --country are required.\n")
+    if not args.park and (not args.city or not args.country):
+        print("Error: either --park or both --city and --country are required.\n")
         print_examples()
         sys.exit(1)
 
@@ -1013,13 +1577,39 @@ Examples:
 
     # Get coordinates and generate poster
     try:
-        if args.latitude and args.longitude:
+        if args.park:
+            park_lat, park_lon, auto_dist, park_display_name = get_park_info(args.park)
+            coords = (park_lat, park_lon)
+            # Use auto-calculated distance unless user explicitly passed --distance
+            if args.distance is None:
+                args.distance = auto_dist
+            args.park_mode = True
+            args.park_labels = True
+            args.topo_mode = True
+            args.show_boundary = True
+            # Default display name from OSM unless user provided one
+            if not args.display_city:
+                args.display_city = park_display_name
+            if not args.display_country:
+                args.display_country = "NATIONAL PARK"
+            if not args.city:
+                args.city = args.park
+            if not args.country:
+                args.country = "USA"
+            # Default to national_park theme if user hasn't chosen one
+            if args.theme == "terracotta":
+                args.theme = "national_park"
+                themes_to_generate = ["national_park"]
+        elif args.latitude and args.longitude:
             lat = parse(args.latitude)
             lon = parse(args.longitude)
-            coords = [lat, lon]
+            coords = (lat, lon)
             print(f"✓ Coordinates: {', '.join([str(i) for i in coords])}")
         else:
             coords = get_coordinates(args.city, args.country)
+
+        if args.distance is None:
+            args.distance = 18000
 
         for theme_name in themes_to_generate:
             THEME = load_theme(theme_name)
@@ -1037,6 +1627,13 @@ Examples:
                 display_city=args.display_city,
                 display_country=args.display_country,
                 fonts=custom_fonts,
+                park_mode=args.park_mode,
+                park_labels=args.park_labels,
+                max_peaks=args.max_peaks,
+                topo_mode=args.topo_mode,
+                contour_interval=args.contour_interval,
+                show_boundary=args.show_boundary,
+                park_name=args.park,
             )
 
         print("\n" + "=" * 50)

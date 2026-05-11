@@ -1,0 +1,22 @@
+{
+    "name": "National Park",
+    "description": "Vintage wilderness map style with trails, peaks, viewpoints, and campgrounds",
+    "bg": "#EDE8DC",
+    "text": "#2D3B2E",
+    "gradient_color": "#EDE8DC",
+    "water": "#7BA7BC",
+    "parks": "#B8D4A8",
+    "trails": "#8B5E3C",
+    "peaks": "#2D3B2E",
+    "viewpoints": "#B8860B",
+    "campgrounds": "#8B2020",
+    "trailheads": "#5C3D1E",
+    "contours": "#9B8B75",
+    "boundary": "#2D3B2E",
+    "road_motorway": "#7A5C3C",
+    "road_primary": "#8B6B47",
+    "road_secondary": "#A07850",
+    "road_tertiary": "#B89068",
+    "road_residential": "#C8A880",
+    "road_default": "#B89068"
+}
